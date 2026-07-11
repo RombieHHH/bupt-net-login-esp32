@@ -13,7 +13,7 @@
 - 自动完成 web 认证（Cookie 获取 + POST 登录 + 验证）
 - 凭据加密存储（硬件 HMAC 派生密钥 + NVS AES-XTS 加密）
 - 首次运行时串口交互输入学号密码
-- 可配置保活间隔（登录状态定期探测）q
+- 可配置保活间隔（登录状态定期探测）
 - 断线自动重连
 - IPv6 SLAAC 地址获取与连通性测试（ping 2400:3200::1）
 
@@ -30,6 +30,20 @@ idf.py menuconfig    # 开启 IPv6
 idf.py build
 idf.py -p COMX flash monitor
 ```
+
+## 组件配置
+
+登录驱动位于 `components/bupt_net`，应用通过 `#include "bupt_net.h"` 使用。
+可调参数集中在 `components/bupt_net/include/bupt_net.h`。
+
+IPv6 默认启用，可以在该头文件中按需调整：
+
+```c
+#define BUPT_NET_ENABLE_IPV6       1  /* 0：关闭全部 IPv6 功能 */
+#define BUPT_NET_ENABLE_IPV6_PING  1  /* 0：保留 SLAAC，关闭 ping */
+```
+
+同一位置还可以修改 IPv6 ping 目标。
 
 ### menuconfig 选项
 
@@ -58,6 +72,23 @@ Save to NVS? (y/n): y      ← 保存到 Flash
 首次启动会在空闲的 eFuse `BLOCK_KEY0` 中生成 HMAC 密钥。写入 eFuse 是不可逆的；
 已经将该密钥块用于其他用途的设备，应先在 `menuconfig` 中选择另一个空闲密钥块。
 
+## 平台移植
+
+核心认证流程只依赖 WiFi 和 HTTP，可移植到其他芯片；主要兼容性限制来自凭据存储、
+网络接口 API 和构建系统。目前只有 ESP32-C3 完成真机验证。
+
+- ESP32-S2、ESP32-S3、ESP32-C5、ESP32-C6 具有硬件 HMAC，预计可以继续使用当前
+  NVS 加密方案，但必须确认所选 eFuse 密钥块空闲，并为目标芯片重新生成配置。
+
+- 经典 ESP32 和 ESP32-C2 不支持当前基于硬件 HMAC 的 NVS 密钥派生方案。HTTP
+  登录逻辑仍可复用，但需要改用普通 NVS、基于 Flash Encryption 的保护方案，或由
+  上层应用提供凭据存储。
+- 不同开发板可能使用 UART0、USB CDC 或 USB Serial/JTAG 作为控制台；首次凭据输入
+  固定使用 UART0，移植时需要确认控制台连接方式。
+
+对于其他带 WiFi 的 ESP32，HMAC NVS 加密是最主要的平台能力门槛；WiFi、HTTP、
+FreeRTOS 和 lwIP 部分使用的是 ESP-IDF 公共 API，通常只需少量适配。
+
 ## 认证流程
 
 1. WiFi 连接 `BUPT-portal`（无密码，WIFI_AUTH_OPEN）
@@ -75,13 +106,13 @@ Save to NVS? (y/n): y      ← 保存到 Flash
 [INFO   ][00:00:00] Loaded credentials from NVS
 [INFO   ][00:00:00] User: 202xxxxxxx
 [INFO   ][00:00:00] Connecting to BUPT-portal...
-[INFO   ][00:00:04] Got IP: 10.129.xxx.xxx
-[INFO   ][00:00:04] Probing...
-[INFO   ][00:00:04] Probe status: 204
-[INFO   ][00:00:04] Already logged in
-[INFO   ][00:00:04] IPv6 global: 2001:da8:215:xxxx:xxxx:xxxx:xxxx:xxxx
-[INFO   ][00:00:06] IPv6 ping: OK (0% loss)
-[INFO   ][00:00:06] Sleeping 120s...
+[INFO   ][00:00:01] Got IP: 10.129.xxx.xxx
+[INFO   ][00:00:01] Probing...
+[INFO   ][00:00:01] Probe status: 204
+[INFO   ][00:00:01] Already logged in
+[INFO   ] IPv6 global: 2001:0da8:0215:xxxx:xxxx:xxxx:xxxx:xxxx
+[INFO   ] IPv6 ping: OK (0% loss)
+[INFO   ][00:00:17] Sleeping 120s...
 ```
 
 ## 参考与许可

@@ -17,12 +17,12 @@
  * 认证流程参考 YouXam/bupt-net-login (https://github.com/YouXam/bupt-net-login)
  */
 
-#pragma once
+#include "bupt_net.h"
 
 /* ================================================================
- *  bupt_net.h — 北邮校园网自动登录驱动 (ESP32-C3)
+ *  bupt_net — 北邮校园网自动登录驱动 (ESP32-C3)
  *
- *  单文件驱动，内聚全部功能：WiFi 连接、HTTP 探测、认证、串口日志。
+ *  核心模块内聚 WiFi 连接、HTTP 探测、认证和串口日志。
  *  对外暴露 bupt_net_init() 和 bupt_net_run() 两个函数。
  *
  *  认证流程：
@@ -53,22 +53,30 @@
 #include "esp_http_client.h"
 #include "esp_mac.h"
 #include "driver/uart.h"
-#include "ping/ping_sock.h"
 
 /* ================================================================
  *  [2] 常量宏
  * ================================================================ */
-#define PROBE_URL        "http://connect.rom.miui.com/generate_204?cmd=redirect&arubalp=12345"
-#define WIFI_SSID        "BUPT-portal"
-#define NVS_NAMESPACE    "bupt"
-#define NVS_KEY_USER     "user"
-#define NVS_KEY_PASS     "pass"
-#define HTTP_TIMEOUT_MS  10000
-#define WIFI_MAX_RETRY   5
+#define WIFI_SSID            "BUPT-portal"
+#define PROBE_URL            "http://connect.rom.miui.com/generate_204?cmd=redirect&arubalp=12345"
+#define AUTH_SERVER_PATTERN  "10.3.8"
+#define HTTP_TIMEOUT_MS      10000
+#define WIFI_MAX_RETRY       5
+#define NVS_NAMESPACE        "bupt"
+#define NVS_KEY_USER         "user"
+#define NVS_KEY_PASS         "pass"
+#define CREDENTIAL_MAX_LEN   64
 
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
-#define IPV6_READY_BIT      BIT2
+
+#if BUPT_NET_ENABLE_IPV6
+void bupt_ipv6_init(esp_netif_t *netif);
+void bupt_ipv6_reset(void);
+void bupt_ipv6_on_got_ip(const ip_event_got_ip6_t *event);
+void bupt_ipv6_start(void);
+void bupt_ipv6_wait(void);
+#endif
 
 /* ================================================================
  *  [3] 日志宏 — [LEVEL][HH:MM:SS] 格式，输出到串口
@@ -92,7 +100,7 @@ static inline void _log(const char *level, const char *fmt, ...) {
 #define LOG_ERROR(fmt, ...)  _log("ERROR  ", fmt, ##__VA_ARGS__)
 
 /* ---- 逐字符读取一行（UART 驱动，阻塞等待不会触发 task_wdt）---- */
-static void read_line(char *buf, size_t len) {
+static void read_line(char *buf, size_t len, bool mask_input) {
     size_t i = 0;
     char c;
     while (i < len - 1) {
@@ -112,7 +120,7 @@ static void read_line(char *buf, size_t len) {
                 continue;
             }
             buf[i++] = c;
-            printf("%c", c);
+            printf("%c", mask_input ? '*' : c);
             fflush(stdout);
         }
     }
@@ -165,116 +173,6 @@ static int s_wifi_retry = 0;
 static bool s_wifi_connected = false;
 static esp_netif_t *s_netif = NULL;
 
-static void log_ipv6(const char *msg, const esp_ip6_addr_t *ip6) {
-    char buf[40];
-    const uint8_t *b = (const uint8_t *)ip6->addr;
-    snprintf(buf, sizeof(buf),
-        "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
-        "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-        (unsigned int)b[0], (unsigned int)b[1],
-        (unsigned int)b[2], (unsigned int)b[3],
-        (unsigned int)b[4], (unsigned int)b[5],
-        (unsigned int)b[6], (unsigned int)b[7],
-        (unsigned int)b[8], (unsigned int)b[9],
-        (unsigned int)b[10], (unsigned int)b[11],
-        (unsigned int)b[12], (unsigned int)b[13],
-        (unsigned int)b[14], (unsigned int)b[15]);
-    LOG_INFO("%s: %s", msg, buf);
-}
-
-/* ---- IPv6 连通性测试：ping 2400:3200::1（中国电信 IPv6 DNS） ---- */
-static SemaphoreHandle_t s_ping_done = NULL;
-static uint32_t s_ping_sent = 0, s_ping_recv = 0;
-
-static void ping_on_success(esp_ping_handle_t h, void *ctx) {
-    s_ping_recv++;
-}
-
-static void ping_on_timeout(esp_ping_handle_t h, void *ctx) {}
-
-static void ping_on_end(esp_ping_handle_t h, void *ctx) {
-    esp_ping_get_profile(h, ESP_PING_PROF_REQUEST, &s_ping_sent, sizeof(s_ping_sent));
-    esp_ping_get_profile(h, ESP_PING_PROF_REPLY, &s_ping_recv, sizeof(s_ping_recv));
-    if (s_ping_sent > 0 && s_ping_recv == s_ping_sent) {
-        LOG_INFO("IPv6 ping: OK (0%% loss)");
-    } else if (s_ping_sent > 0) {
-        uint32_t loss = ((s_ping_sent - s_ping_recv) * 100) / s_ping_sent;
-        LOG_WARN("IPv6 ping: %lu%% loss (%lu/%lu)",
-                 (unsigned long)loss, (unsigned long)s_ping_recv, (unsigned long)s_ping_sent);
-    } else {
-        LOG_WARN("IPv6 ping: no reply");
-    }
-    if (s_ping_done) xSemaphoreGive(s_ping_done);
-}
-
-static void ping_ipv6_check(void) {
-    ip_addr_t target_addr;
-    ipaddr_aton("2400:3200::1", &target_addr);
-
-    esp_ping_config_t ping_config = ESP_PING_DEFAULT_CONFIG();
-    ping_config.target_addr = target_addr;
-    ping_config.count = 10;
-    ping_config.timeout_ms = 2000;
-    ping_config.task_stack_size = 2048;
-    ping_config.task_prio = 2;
-
-    esp_ping_callbacks_t cbs = {
-        .on_ping_success = ping_on_success,
-        .on_ping_timeout = ping_on_timeout,
-        .on_ping_end = ping_on_end,
-        .cb_args = NULL,
-    };
-
-    s_ping_done = xSemaphoreCreateBinary();
-    s_ping_sent = 0;
-    s_ping_recv = 0;
-    esp_ping_handle_t ping;
-    esp_ping_new_session(&ping_config, &cbs, &ping);
-    esp_ping_start(ping);
-
-    if (xSemaphoreTake(s_ping_done, pdMS_TO_TICKS(10000)) != pdTRUE) {
-        LOG_WARN("IPv6 ping: timeout");
-        esp_ping_stop(ping);
-    }
-    esp_ping_delete_session(ping);
-    vSemaphoreDelete(s_ping_done);
-    s_ping_done = NULL;
-}
-
-/* ---- 每次探测循环中打印 IPv6 状态 ---- */
-static void print_ipv6_status(void) {
-    if (!s_netif) { LOG_WARN("IPv6: no netif"); return; }
-    bool got = false;
-    esp_ip6_addr_t ip6;
-
-    if (esp_netif_get_ip6_global(s_netif, &ip6) == ESP_OK) {
-        log_ipv6("IPv6 global", &ip6);
-        got = true;
-    }
-
-    if (!got) {
-        LOG_WARN("IPv6: no address assigned yet");
-        return;
-    }
-
-    ping_ipv6_check();
-}
-
-/* ---- 等待 IPv6 事件并测试连通性（最多等 10 秒） ---- */
-static void wait_ipv6(void) {
-    if (!s_netif) return;
-
-    EventBits_t bits = xEventGroupWaitBits(
-        s_wifi_event_group, IPV6_READY_BIT,
-        pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
-
-    if (bits & IPV6_READY_BIT) {
-        print_ipv6_status();
-    } else {
-        LOG_WARN("No IPv6 global address within 10s (network may not support SLAAC)");
-    }
-}
-
 static void wifi_event_handler(void *arg,
                                esp_event_base_t event_base,
                                int32_t event_id,
@@ -286,7 +184,9 @@ static void wifi_event_handler(void *arg,
         wifi_event_sta_disconnected_t *ev =
             (wifi_event_sta_disconnected_t *)event_data;
         s_wifi_connected = false;
-        xEventGroupClearBits(s_wifi_event_group, IPV6_READY_BIT);
+#if BUPT_NET_ENABLE_IPV6
+        bupt_ipv6_reset();
+#endif
         if (s_wifi_retry < WIFI_MAX_RETRY) {
             esp_wifi_connect();
             s_wifi_retry++;
@@ -305,11 +205,10 @@ static void wifi_event_handler(void *arg,
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     } else if (event_base == IP_EVENT &&
                event_id == IP_EVENT_GOT_IP6) {
+#if BUPT_NET_ENABLE_IPV6
         ip_event_got_ip6_t *event = (ip_event_got_ip6_t *)event_data;
-        if (esp_netif_ip6_get_addr_type(&event->ip6_info.ip) ==
-            ESP_IP6_ADDR_IS_GLOBAL) {
-            xEventGroupSetBits(s_wifi_event_group, IPV6_READY_BIT);
-        }
+        bupt_ipv6_on_got_ip(event);
+#endif
     }
 }
 
@@ -319,6 +218,9 @@ static void wifi_init(void) {
     esp_netif_init();
     esp_event_loop_create_default();
     s_netif = esp_netif_create_default_wifi_sta();
+#if BUPT_NET_ENABLE_IPV6
+    bupt_ipv6_init(s_netif);
+#endif
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_wifi_init(&cfg);
@@ -327,8 +229,10 @@ static void wifi_init(void) {
                                &wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                &wifi_event_handler, NULL);
+#if BUPT_NET_ENABLE_IPV6
     esp_event_handler_register(IP_EVENT, IP_EVENT_GOT_IP6,
                                &wifi_event_handler, NULL);
+#endif
 
     esp_wifi_set_mode(WIFI_MODE_STA);
 }
@@ -338,7 +242,7 @@ static esp_err_t wifi_connect(void) {
 
     /* 清除旧的事件位 */
     xEventGroupClearBits(s_wifi_event_group,
-                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | IPV6_READY_BIT);
+                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     s_wifi_retry = 0;
 
     wifi_config_t wifi_config = { 0 };
@@ -355,10 +259,9 @@ static esp_err_t wifi_connect(void) {
         pdFALSE, pdFALSE, portMAX_DELAY);
 
     if (bits & WIFI_CONNECTED_BIT) {
-        /* 启用 IPv6（link-local 地址是 SLAAC 的必要前提） */
-        if (s_netif) {
-            esp_netif_create_ip6_linklocal(s_netif);
-        }
+#if BUPT_NET_ENABLE_IPV6
+        bupt_ipv6_start();
+#endif
         return ESP_OK;
     }
     return ESP_FAIL;
@@ -374,7 +277,6 @@ typedef struct {
 static esp_err_t _http_event_handler(esp_http_client_event_t *evt) {
     http_resp_ctx_t *ctx = (http_resp_ctx_t *)evt->user_data;
     if (evt->event_id == HTTP_EVENT_ON_HEADER && ctx && evt->header_key && evt->header_value) {
-        LOG_INFO("  Header: %s = %s", evt->header_key, evt->header_value);
         if (strcasecmp(evt->header_key, "Location") == 0 && !ctx->location[0]) {
             strncpy(ctx->location, evt->header_value, sizeof(ctx->location) - 1);
         }
@@ -453,7 +355,7 @@ static probe_result_t http_probe(char *auth_url, size_t auth_url_len) {
     }
 
     if (status >= 300 && status < 400) {
-        if (ctx.location[0] && strstr(ctx.location, "10.3.8")) {
+        if (ctx.location[0] && strstr(ctx.location, AUTH_SERVER_PATTERN)) {
             LOG_INFO("Auth server: %s", ctx.location);
             if (auth_url && auth_url_len > 0) {
                 strncpy(auth_url, ctx.location, auth_url_len - 1);
@@ -489,7 +391,6 @@ static bool http_authenticate(const char *auth_url,
                             : strlen(ctx.set_cookie);
             memcpy(session, ctx.set_cookie, n);
             session[n] = '\0';
-            LOG_INFO("Session: %s", session);
         } else {
             LOG_ERROR("No Set-Cookie in response (status=%d)", status);
             return false;
@@ -563,8 +464,8 @@ void bupt_net_init(void) {
  * @param keepalive_sec 保活间隔（秒），0=单次执行，>0=循环保活
  */
 void bupt_net_run(const char *user, const char *pass, int keepalive_sec) {
-    char username[64] = {0};
-    char password[64] = {0};
+    char username[CREDENTIAL_MAX_LEN] = {0};
+    char password[CREDENTIAL_MAX_LEN] = {0};
 
     /* ---- 获取凭据 ---- */
     if (user && pass) {
@@ -590,21 +491,21 @@ void bupt_net_run(const char *user, const char *pass, int keepalive_sec) {
             /* 读取用户名 */
             printf("Username: ");
             fflush(stdout);
-            read_line(username, sizeof(username));
+            read_line(username, sizeof(username), false);
             while (strlen(username) == 0) {
                 printf("Username: ");
                 fflush(stdout);
-                read_line(username, sizeof(username));
+                read_line(username, sizeof(username), false);
             }
 
             /* 读取密码 */
             printf("Password: ");
             fflush(stdout);
-            read_line(password, sizeof(password));
+            read_line(password, sizeof(password), true);
             while (strlen(password) == 0) {
                 printf("Password: ");
                 fflush(stdout);
-                read_line(password, sizeof(password));
+                read_line(password, sizeof(password), true);
             }
 
             /* 确认并写入 NVS */
@@ -612,7 +513,7 @@ void bupt_net_run(const char *user, const char *pass, int keepalive_sec) {
             printf("Save to NVS? (y/n): ");
             fflush(stdout);
             do {
-                read_line(confirm, sizeof(confirm));
+                read_line(confirm, sizeof(confirm), false);
             } while (strlen(confirm) == 0);
 
             if (confirm[0] == 'y' || confirm[0] == 'Y') {
@@ -639,7 +540,10 @@ void bupt_net_run(const char *user, const char *pass, int keepalive_sec) {
             LOG_WARN("WiFi lost, reconnecting...");
             s_wifi_retry = 0;
             xEventGroupClearBits(s_wifi_event_group,
-                                 WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | IPV6_READY_BIT);
+                                 WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+#if BUPT_NET_ENABLE_IPV6
+            bupt_ipv6_reset();
+#endif
             esp_wifi_connect();
             EventBits_t bits = xEventGroupWaitBits(
                 s_wifi_event_group,
@@ -658,8 +562,9 @@ void bupt_net_run(const char *user, const char *pass, int keepalive_sec) {
 
         if (probe == PROBE_LOGGED_IN) {
             LOG_INFO("Already logged in");
-            LOG_INFO("Waiting for IPv6 SLAAC...");
-            wait_ipv6();
+#if BUPT_NET_ENABLE_IPV6
+            bupt_ipv6_wait();
+#endif
             fail_count = 0;
             if (keepalive_sec <= 0) break;
             LOG_INFO("Sleeping %ds...", keepalive_sec);
@@ -671,9 +576,9 @@ void bupt_net_run(const char *user, const char *pass, int keepalive_sec) {
             LOG_INFO("Status: 302 — need login");
             bool ok = http_authenticate(auth_url, username, password);
             if (ok) {
-                /* 认证成功后才下发 IPv6 RA，等待获取 */
-                LOG_INFO("Waiting for IPv6 SLAAC...");
-                wait_ipv6();
+#if BUPT_NET_ENABLE_IPV6
+                bupt_ipv6_wait();
+#endif
                 fail_count = 0;
                 if (keepalive_sec <= 0) break;
                 LOG_INFO("Sleeping %ds...", keepalive_sec);
