@@ -202,6 +202,9 @@ static void wifi_event_handler(void *arg,
         LOG_INFO("Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_wifi_retry = 0;
         s_wifi_connected = true;
+#if BUPT_NET_ENABLE_IPV6
+        bupt_ipv6_start();
+#endif
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     } else if (event_base == IP_EVENT &&
                event_id == IP_EVENT_GOT_IP6) {
@@ -259,9 +262,6 @@ static esp_err_t wifi_connect(void) {
         pdFALSE, pdFALSE, portMAX_DELAY);
 
     if (bits & WIFI_CONNECTED_BIT) {
-#if BUPT_NET_ENABLE_IPV6
-        bupt_ipv6_start();
-#endif
         return ESP_OK;
     }
     return ESP_FAIL;
