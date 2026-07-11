@@ -68,6 +68,7 @@
 
 #define WIFI_CONNECTED_BIT  BIT0
 #define WIFI_FAIL_BIT       BIT1
+#define IPV6_READY_BIT      BIT2
 
 /* ================================================================
  *  [3] 日志宏 — [LEVEL][HH:MM:SS] 格式，输出到串口
@@ -259,22 +260,19 @@ static void print_ipv6_status(void) {
     ping_ipv6_check();
 }
 
-/* ---- 等待并打印 IPv6 地址（最多等 10 秒，登录后调用） ---- */
+/* ---- 等待 IPv6 事件并测试连通性（最多等 10 秒） ---- */
 static void wait_ipv6(void) {
     if (!s_netif) return;
 
-    esp_ip6_addr_t ip6;
+    EventBits_t bits = xEventGroupWaitBits(
+        s_wifi_event_group, IPV6_READY_BIT,
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
 
-    /* 等待 global 地址（SLAAC 需要 RA，可能延迟几秒） */
-    for (int i = 0; i < 20; i++) {
-        if (esp_netif_get_ip6_global(s_netif, &ip6) == ESP_OK) {
-            log_ipv6("IPv6 global", &ip6);
-            ping_ipv6_check();
-            return;
-        }
-        vTaskDelay(pdMS_TO_TICKS(500));
+    if (bits & IPV6_READY_BIT) {
+        print_ipv6_status();
+    } else {
+        LOG_WARN("No IPv6 global address within 10s (network may not support SLAAC)");
     }
-    LOG_WARN("No IPv6 global address within 10s (network may not support SLAAC)");
 }
 
 static void wifi_event_handler(void *arg,
@@ -288,6 +286,7 @@ static void wifi_event_handler(void *arg,
         wifi_event_sta_disconnected_t *ev =
             (wifi_event_sta_disconnected_t *)event_data;
         s_wifi_connected = false;
+        xEventGroupClearBits(s_wifi_event_group, IPV6_READY_BIT);
         if (s_wifi_retry < WIFI_MAX_RETRY) {
             esp_wifi_connect();
             s_wifi_retry++;
@@ -307,8 +306,9 @@ static void wifi_event_handler(void *arg,
     } else if (event_base == IP_EVENT &&
                event_id == IP_EVENT_GOT_IP6) {
         ip_event_got_ip6_t *event = (ip_event_got_ip6_t *)event_data;
-        if (((const uint8_t *)event->ip6_info.ip.addr)[0] == 0x20) {
-            log_ipv6("IPv6 global", &event->ip6_info.ip);
+        if (esp_netif_ip6_get_addr_type(&event->ip6_info.ip) ==
+            ESP_IP6_ADDR_IS_GLOBAL) {
+            xEventGroupSetBits(s_wifi_event_group, IPV6_READY_BIT);
         }
     }
 }
@@ -338,7 +338,7 @@ static esp_err_t wifi_connect(void) {
 
     /* 清除旧的事件位 */
     xEventGroupClearBits(s_wifi_event_group,
-                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | IPV6_READY_BIT);
     s_wifi_retry = 0;
 
     wifi_config_t wifi_config = { 0 };
@@ -542,13 +542,14 @@ static bool http_authenticate(const char *auth_url,
  * 必须在使用其他功能前调用一次。
  */
 void bupt_net_init(void) {
-    /* 初始化 NVS */
+    /* CONFIG_NVS_ENCRYPTION 启用后，默认 NVS 由硬件 HMAC 密钥加密。 */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_flash_init();
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
     }
+    ESP_ERROR_CHECK(ret);
 
     /* 初始化 WiFi */
     wifi_init();
@@ -638,7 +639,7 @@ void bupt_net_run(const char *user, const char *pass, int keepalive_sec) {
             LOG_WARN("WiFi lost, reconnecting...");
             s_wifi_retry = 0;
             xEventGroupClearBits(s_wifi_event_group,
-                                 WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+                                 WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | IPV6_READY_BIT);
             esp_wifi_connect();
             EventBits_t bits = xEventGroupWaitBits(
                 s_wifi_event_group,
@@ -657,7 +658,8 @@ void bupt_net_run(const char *user, const char *pass, int keepalive_sec) {
 
         if (probe == PROBE_LOGGED_IN) {
             LOG_INFO("Already logged in");
-            print_ipv6_status();
+            LOG_INFO("Waiting for IPv6 SLAAC...");
+            wait_ipv6();
             fail_count = 0;
             if (keepalive_sec <= 0) break;
             LOG_INFO("Sleeping %ds...", keepalive_sec);
@@ -672,7 +674,6 @@ void bupt_net_run(const char *user, const char *pass, int keepalive_sec) {
                 /* 认证成功后才下发 IPv6 RA，等待获取 */
                 LOG_INFO("Waiting for IPv6 SLAAC...");
                 wait_ipv6();
-                print_ipv6_status();
                 fail_count = 0;
                 if (keepalive_sec <= 0) break;
                 LOG_INFO("Sleeping %ds...", keepalive_sec);
